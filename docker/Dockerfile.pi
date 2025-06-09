@@ -1,0 +1,38 @@
+FROM ubuntu:24.04
+
+# Install Node.js 20 and dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    python3 \
+    pkg-config \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libjpeg-dev \
+    libgif-dev \
+    librsvg2-dev \
+    libpixman-1-dev \
+    libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs
+
+# Install pnpm
+RUN npm install -g pnpm
+WORKDIR /usr/app
+
+# Copy everything (workspace needs complete structure)
+COPY . .
+
+# Force rebuild of ALL native modules (this fixed GLIBC!)
+RUN rm -rf node_modules
+RUN pnpm install --no-frozen-lockfile --force
+
+# Build frontend (ADD THIS LINE!)
+RUN cd packages/frontend && pnpm build
+EXPOSE 8080
+WORKDIR /usr/app/packages/backend
+CMD ["node", "dist/index.js"]
+
