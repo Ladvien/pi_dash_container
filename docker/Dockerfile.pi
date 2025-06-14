@@ -1,11 +1,33 @@
 FROM ubuntu:24.04
 
-# Install Node.js 20 and dependencies
+# Set ARM64-specific environment variables (cached layer)
+ENV ARCH=arm64 \
+    TARGET_ARCH=arm64 \
+    npm_config_arch=arm64 \
+    npm_config_target_arch=arm64 \
+    CC=gcc \
+    CXX=g++ \
+    AR=ar \
+    STRIP=strip \
+    npm_config_build_from_source=true \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=true \
+    NODE_OPTIONS="--max-old-space-size=4096" \
+    npm_config_jobs=2
+
+# Install essential build dependencies (rarely changes - cached layer)
 RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
     python3 \
+    python3-dev \
+    python3-pip \
     pkg-config \
+    git \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install additional libraries (may change - separate cached layer)
+RUN apt-get update && apt-get install -y \
     libcairo2-dev \
     libpango1.0-dev \
     libjpeg-dev \
@@ -13,26 +35,105 @@ RUN apt-get update && apt-get install -y \
     librsvg2-dev \
     libpixman-1-dev \
     libpng-dev \
+    libffi-dev \
+    libssl-dev \
+    libbz2-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    llvm \
+    libncurses5-dev \
+    libncursesw5-dev \
+    xz-utils \
+    tk-dev \
+    libxml2-dev \
+    libxmlsec1-dev \
+    liblzma-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Node.js 20
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs
+# Configure Python (cached layer)
+ENV npm_config_python=/usr/bin/python3
+RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# Install pnpm
-RUN npm install -g pnpm
+# Install Node.js 20 (cached layer)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify Node.js and install pnpm (cached layer)
+RUN node --version && npm --version && node -p "process.arch" \
+    && npm install -g pnpm
+
+# Set working directory
 WORKDIR /usr/app
 
-# Copy everything (workspace needs complete structure)
+# Copy only package files first (cached if package.json files don't change)
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/common/package.json ./packages/common/
+COPY packages/warehouses/package.json ./packages/warehouses/
+COPY packages/backend/package.json ./packages/backend/
+COPY packages/frontend/package.json ./packages/frontend/
+COPY packages/cli/package.json ./packages/cli/
+COPY packages/e2e/package.json ./packages/e2e/
+
+# Set registry and install dependencies (cached if package files don't change)
+RUN pnpm config set registry https://registry.npmmirror.com
+
+# Install with better error handling, exclude problematic SDK packages
+RUN bash -c '\
+  set -e; \
+  for i in {1..3}; do \
+    pnpm install --no-frozen-lockfile \
+      --filter="!@lightdash/sdk-next-test-app" \
+      --filter="!@lightdash/sdk-test-app" \
+      --config.build-from-source=true \
+      --config.jobs=2 \
+      --fetch-timeout=600000 && break || sleep 30; \
+  done'
+
+# Ensure TypeScript is available globally for builds
+RUN npm install -g typescript
+
+# Copy source code (this layer rebuilds when source changes)
 COPY . .
 
-# Force rebuild of ALL native modules (this fixed GLIBC!)
-RUN rm -rf node_modules
-RUN pnpm install --no-frozen-lockfile --force
+# Build in correct order with better error handling and verification
+RUN echo "Building common packages..." && \
+    pnpm -F common build && \
+    echo "✓ Common build completed successfully"
 
-# Build frontend (ADD THIS LINE!)
-RUN cd packages/frontend && pnpm build
+RUN echo "Building warehouses..." && \
+    pnpm -F warehouses build && \
+    echo "✓ Warehouses build completed successfully"
+
+RUN echo "Building warehouses and backend together..." && \
+    pnpm --filter=warehouses --filter=backend build && \
+    echo "✓ Warehouses and Backend build completed successfully"
+
+
+# Build frontend with memory constraints  
+RUN echo "Building frontend..." && \
+    NODE_OPTIONS="--max-old-space-size=4096" pnpm -F frontend build && \
+    echo "✓ Frontend build completed successfully"
+
+# Set production environment
+ENV NODE_ENV=production
+
+# Create non-root user for security
+RUN groupadd -r lightdash && useradd -r -g lightdash lightdash
+RUN chown -R lightdash:lightdash /usr/app
+USER lightdash
+
+# Expose port
 EXPOSE 8080
+
+# Set working directory to backend
 WORKDIR /usr/app/packages/backend
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8080/api/v1/health || exit 1
+
+# Start command
 CMD ["node", "dist/index.js"]
 
